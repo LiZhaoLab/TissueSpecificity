@@ -1,0 +1,657 @@
+---
+title: "200709_Tissuespecificity_followalong.rmd"
+author: "Evan Witt"
+date: "7/9/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(fig.width=12, fig.height=8) 
+knitr::opts_chunk$set(message = FALSE)
+knitr::opts_chunk$set(warning = FALSE)
+
+library(ggplot2)
+library(ggpubr)
+library(plyr)
+library(dplyr)
+library(tidyr)
+library(cowplot)
+library(rstatix)
+library(ChIPpeakAnno)
+library(TxDb.Dmelanogaster.UCSC.dm6.ensGene)
+library(tidyverse)
+library(ggrepel)
+library(GenomicRanges)
+library(ChIPpeakAnno)
+library(RColorBrewer)
+
+
+
+
+tau<-function(x){
+  if(any(is.na(x))) stop('NA\'s need to be 0.')
+  if(any(x<0)) stop('Negative input values not permitted. Maybe data is log transformed?')
+  t<-sum(1-x/max(x))/(length(x)-1)
+}
+
+redist.fun<-function(x){(x/(max(x)))}
+
+```
+
+## R Markdown
+Note: if you downloaded this somewhere other than ~/Downloads, change paths appropriately
+
+First, let's set up our main dataset using data from flyatlas, Kondo et al. 2017, and Neme and Tautz 2014
+```{r}
+
+#Atac-seq data: 
+ovaryPeaks<-read.delim("~/Downloads/tissueSpecificityData/ovaryPeaks.narrowPeak", header=F)
+testisPeaks<-read.delim("~/Downloads/tissueSpecificityData/testisPeaks.narrowPeak", header=F)
+S2Peaks<-read.delim("~/Downloads/tissueSpecificityData/S2Peaks.narrowPeak", header=F)
+
+
+#TF data from FLYNET
+flynet<-read.delim("~/Downloads/tissueSpecificityData/tf_gene.txt")
+
+
+
+
+dataset <-read.table("~/Downloads/tissueSpecificityData/190508_flyatlas_allgenes_alltissues_uniq_FPKM.txt")
+dataset<-dataset %>% pivot_longer(-merged.ID, names_to="Tissue", values_to="FPKM")
+names(dataset)<-c("gene", "Tissue","FPKM")
+dataset$Tissue<-gsub(dataset$Tissue, pattern="ale", replacement="ale ")
+dataset<-subset(dataset, !Tissue %in% c("Male Whole", "Female whole"))
+
+
+
+
+dataset <-unique(dataset)
+
+#colnames(dataset)<-gsub(x=colnames(dataset), pattern="merged.ID", replacement="gene")
+
+#from:http://genesdev.cshlp.org/content/suppl/2017/10/19/31.18.1841.DC1/Supplemental_TableS1.xlsx
+kondoages<-read.csv("~/Downloads/tissueSpecificityData/kondoages.csv")
+kondoages<-kondoages[,c(1,7)]
+names(kondoages)<-c("gene", "Age")
+
+#from: Neme and Tautz 2014: http://gentree.ioz.ac.cn/download/dm6_ver78_age.tsv
+Zhangages<-read.delim("~/Downloads/tissueSpecificityData/dm6_ver78_age.tsv")
+names(Zhangages)<-c("gene", "transcript", "Age")
+
+
+
+#Here I'm combining consensus gene ages from Neme-Tautz and Kondo, since they cover different periods.  Ambiguous genes are excluded.
+kondoages<-join(kondoages, subset(Zhangages, Age== 0), by="gene", type="inner")
+kondoages<-kondoages[,c(1,2)]
+kondoages<-droplevels(subset(kondoages, Age== "Pan-drosophilid" | Age== "Bilateria" | Age=="Eukaryota" | Age== "Diptera" | Age=="Cellular_Organisms" | Age=="Diptera"))
+
+Zhangages$Age<-as.character(Zhangages$Age)
+mergedages<-rbind(kondoages, subset(Zhangages, Age != 0)[,c(1,3)])
+
+dataset<-join(mergedages, dataset, by="gene")
+dataset <-na.omit(dataset)
+
+#now gotta log transform it
+dataset$logFPKM<-log2(dataset$FPKM+1)
+dataset[is.na(dataset)] <- 0
+
+
+dataset<-mutate(dataset %>% group_by(gene), tau=tau(logFPKM))   
+
+
+
+dataset$Age<-plyr::mapvalues(dataset$Age, from=c("6", "5", "4", "3", "2", "1", "Pan-drosophilid", "Diptera", "Bilateria", "Eukaryota", "Cellular_Organisms"), to=c("Drosophilid", "Drosophilid", "Drosophilid", "Drosophilid", "Drosophilid", "Drosophilid", "Pre-Drosophilid", "Pre-Drosophilid", "Pre-Bilateria", "Pre-Bilateria", "Pre-Bilateria"))
+#for every gene, make a column with the tissue in which it is maximally expressed
+dataset<-subset(dataset, Tissue !="Whole body")
+flydata<-dataset
+flydata$Tissue<-gsub(flydata$Tissue, pattern = "Spermatheca", replacement=" Spermatheca")
+flydata$Tissue<-gsub(flydata$Tissue, pattern = "Male Testis", replacement="Testis")
+flydata$Tissue<-gsub(flydata$Tissue, pattern = "Female Ovary", replacement="Ovary")
+flydata<-mutate(flydata %>% group_by(gene), maxtissue=Tissue[which.max(FPKM)])
+
+flydata$Age<-factor(flydata$Age, levels=c("Drosophilid", "Pre-Drosophilid", "Pre-Bilateria"))
+
+
+```
+
+
+Let's make some figures! Here's figure 1:
+
+```{r, fig.width=7.5, fig.height=6}
+#figure 1A: 
+#add medians
+flydata2<- flydata %>% group_by(Age) %>%mutate(medtau=median(na.omit(tau)))
+
+#uncomment the geom_text part to add medians to ggplot. it's really slow, so I don't recommend it.
+p1<-ggplot(unique(flydata2[,c("gene", "Age", "tau", "medtau")]), aes(x=Age, y=tau)) +geom_violin(aes(fill=factor(Age)))+theme_classic()+
+ scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))+ geom_boxplot(aes(group=factor(Age)), outlier.shape=NA,width=0.1)+ylab("Tau")+
+  xlab(sprintf('Gene age group (Young \u2192 Old)'))+ theme(legend.position="none")+theme(axis.text=element_text(size=10))+geom_text(aes(y = medtau,x=Age, label = sprintf("%0.2f",round(medtau,2))),position=position_dodge(width = 0.8),size = 2.5,vjust=1.5, check_overlap = T)
+
+rm(flydata2)
+#let's now look at the proportion of genes with max expression in testis and ovary
+
+
+proptestisovary<- flydata %>% group_by(Age,  maxtissue) %>% summarise(n=n()/25) %>%mutate(proportion=n/sum(n), total=sum(n)) 
+
+
+tmp<-data.frame()
+for (i in 1:nrow(proptestisovary)){
+  tmp2<-prop.test(proptestisovary$n[i], proptestisovary$total[i])$conf.int[c(1,2)]
+tmp<-rbind(tmp, tmp2)
+}
+
+
+
+
+colnames(tmp)<-c("min", "max")
+proptestisovary$min<-tmp$min
+proptestisovary$max<-tmp$max
+
+
+proptestisovary$maxtissue<-gsub(proptestisovary$maxtissue, pattern="Male Testis", replacement="Testis")
+proptestisovary$maxtissue<-gsub(proptestisovary$maxtissue, pattern="Female Ovary", replacement="Ovary")
+
+
+names(proptestisovary)[names(proptestisovary)=="maxtissue"]<-"Tissue"
+
+flyothertissues<-subset(proptestisovary, Tissue!="Male Testis")
+
+
+
+p2<-ggplot(subset(proptestisovary, Tissue %in% c("Testis", "Ovary", "Male Carcass", "Female Carcass")), aes(x=Age, y=proportion, group=Tissue, col=Tissue, fill=Tissue))+theme_classic()+
+  geom_point(aes(fill=Tissue))+geom_line()+ylab("Proportions of \n genes  with maximum \n expression in tissue")+
+  geom_errorbar(aes(ymin=min, ymax=max), width=0.05)+theme(axis.text=element_text(size=10), legend.text=element_text(size=10))+xlab("Gene age group")+scale_color_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+
+
+#proportion of expressed genes
+
+
+tissuetotals<-data.frame(table(unique(flydata[,c("gene", "Age")])$Age))
+names(tissuetotals)<-c("Age", "n")
+
+propexpressed<-data.frame(subset(flydata, FPKM>2)%>% group_by(Age, Tissue) %>% dplyr::summarise(total=n()))
+propexpressed<-join(propexpressed, tissuetotals)
+propexpressed$prop<-propexpressed$total/propexpressed$n
+
+tmp<-data.frame()
+for (i in c(1:nrow(propexpressed))){
+  tmp2<-prop.test(propexpressed$total[i], propexpressed$n[i])$conf.int
+tmp<-rbind(tmp, tmp2)
+}
+
+colnames(tmp)<-c("min", "max")
+propexpressed$min<-tmp$min
+propexpressed$max<-tmp$max
+
+
+p3<-ggplot(subset(propexpressed, Tissue %in% c("Female Carcass", "Male Carcass", "Testis", "Ovary")), aes(x=Age, y=prop, group=Tissue, col=Tissue, fill=Tissue))+theme_classic()+
+  geom_point(aes(fill=Tissue))+geom_line()+ylab("Proportion of \n genes expressed with \n FPKM>2 in tissue")+
+  geom_errorbar(aes(ymin=min, ymax=max), width=0.05)+theme(axis.text=element_text(size=10), legend.text=element_text(size=10))+xlab("Gene age group")+scale_color_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+plot_grid(p1, p2,p3, labels=c("A", "B","C"),  nrow=3)
+
+
+#supplemental figure 1:
+supp_figure1<-ggplot(proptestisovary, aes(x=Age, y=proportion, group=Tissue, col=Tissue, fill=Tissue))+theme_classic()+
+  geom_point(aes(fill=Tissue))+geom_line()+ylab("Proportions of \n genes  with maximum \n expression in tissue")+
+  geom_errorbar(aes(ymin=min, ymax=max), width=0.4)+facet_wrap(~Tissue)+theme(axis.text=element_text(size=10),legend.position='none', axis.text.x=element_text(angle=90))+xlab("Gene age group")
+
+
+
+
+
+
+```
+
+Figure 2: Expression for all tissues
+
+```{r, fig.width=11, fig.height=12}
+#flydatascaled <-data.frame(flydata[,c(2,3)], t(apply(flydata[,c(4:30)],1,redist.fun)))
+#flydatascaled <-data.frame(flydata[,c(2,3)],flydata[,c(4:30)])
+
+
+
+
+res = flydata %>% group_by(Tissue) %>% 
+  do(tidy(aov(logFPKM ~ Age, data=.)))
+
+
+res2 = flydata %>% group_by(Tissue) %>%  
+  do(tidy(TukeyHSD(aov(logFPKM ~ Age, data=.))))%>% 
+  group_by(Tissue) %>% summarise(sum=sum(abs(estimate)))
+
+
+stat.test <- flydata %>%
+  group_by(Tissue) %>%
+  wilcox_test(logFPKM ~ Age) %>%
+  adjust_pvalue(method = "bonferroni") %>%
+  add_significance() %>% add_y_position(fun ="max")
+stat.test$y.position[]<-c(12,16,19)
+
+write.table(x=data.frame(stat.test[,c("Tissue", "group1","group2", "p", "p.adj")]), sep='\t',col.names=T, file =  "~/Box Sync/Evan/Zhao lab notebook/Writing/Tissue specificity paper/Supplemental_table_1.txt")
+#is this the best way?
+p1<-ggplot(flydata, aes(x=Age, y=logFPKM))+geom_boxplot(outlier.shape=NA,  width=0.5, aes(fill=Age))+
+  theme_classic()+facet_wrap(~Tissue)+ylab("Log2(FPKM+1)")+
+   ylim(0,21)+
+  theme(axis.text=element_text(size=10))+
+  #scale_y_continuous(breaks=c(0,.25,0.5,.75,1),limits = c(0,1.5))+
+  xlab("Gene age group")+stat_pvalue_manual(stat.test)+theme(axis.text.x=element_blank())+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+
+
+
+res<-na.omit(res)
+res<-join(res, res2)
+#
+#
+#
+
+####proposed replacement for figure 2B
+#need to order largest to smallest
+p2<-ggplot(res, aes(x = reorder(Tissue, -statistic), y=statistic))+geom_bar(stat="identity",fill =ifelse(res$Tissue=="Testis", "#b94971", ifelse(res$Tissue=="Ovary", "#6287da","grey")))+theme_classic() + theme(legend.position='none', axis.text.x=element_text(angle=90), axis.title.x=element_blank())+scale_fill_hue(c=45, l=40)+ylab("ANOVA F statistic") + xlab("Tissue")
+
+
+p3<-ggplot(res, aes(x = reorder(Tissue, -sum), y=sum))+geom_bar(stat="identity",fill =ifelse(res$Tissue=="Testis", "#b94971", ifelse(res$Tissue=="Ovary", "#6287da","grey")))+theme_classic() + theme(legend.position='none', axis.text.x=element_text(angle=90), axis.title.x=element_blank())+scale_fill_hue(c=45, l=40)+ylab("Summed difference\nof group means") 
+
+p2<-plot_grid(p2, p3, nrow=1)
+#
+#
+#
+#
+
+#p2<-ggplot(res, aes(x=sum, y=statistic, col=Tissue) )+ theme_classic()+theme(axis.text=element_text(size=10))+geom_point()+geom_text_repel(aes(label=Tissue ),nudge_y = -.05)+theme(legend.position="none", axis.title = element_text(size=10),axis.text=element_text(size=10))+xlab("Summed difference of group means")+ylab("Anova F-statistic")
+  
+plot_grid(p1, p2, nrow=2, labels=c("A", "B"), rel_widths = c(1.5,1), rel_heights=c(1.2,1))
+```
+
+Figure 3
+```{r, fig.width=9, fig.height=8}
+
+flydatascaled<-mutate(flydata %>% group_by(gene), scaledExp=redist.fun(logFPKM))   
+
+
+
+
+#flydatascaled <-data.frame(flydata[,c(2,3)], t(apply(flydata[,c(4:30)],1,redist.fun)))
+
+connectivity<-data.frame()
+
+genes<-unique(flydatascaled$gene)
+
+
+#this is the code that makes connectivity.csv. this takes forever to run, so uncomment at your own risk
+#for (i in genes[ genes %in% unique(flynet$FLY_TARGET_GENE)]){
+#  tmp<-subset(flynet, FLY_TARGET_GENE== i )$FLY_TF_GENE
+#  tmp<-subset(flydatascaled, gene %in% tmp)
+#  tmp<-tmp %>% group_by(Tissue)%>% summarize(connectivity=sum(scaledExp))
+# tmp$gene<-i
+#  connectivity<-rbind(connectivity, unique(tmp))
+#}
+
+
+#write.csv(connectivity, "~/Downloads/tissueSpecificityData/connectivity.csv", row.names = F)
+
+connectivity<-read.csv("~/Downloads/tissueSpecificityData/connectivity.csv")
+
+connectivity<-join(connectivity, flydatascaled, c("gene", "Tissue"))
+tmp<-gather(connectivity, key="Tissue", value="activity", -gene, -Age)
+tmp<-na.omit(tmp)
+#write.csv(tmp, "~/Box Sync/Evan/Zhao lab notebook/Writing/Tissue specificity paper/Supplemental_file3.csv")
+
+#get correlation coefficients
+connectivity %>% group_by(Tissue) %>% summarise(corr=cor(connectivity, logFPKM, method="spearman")) %>%print(n=100)
+
+ks.test(subset(connectivity, Tissue=="Testis")$connectivity, subset(connectivity, Tissue=="Ovary")$connectivity)
+
+
+
+
+tmp4<-droplevels(subset(connectivity, Tissue=="Testis" | Tissue=="Ovary"))
+stat.test1 <- compare_means(connectivity ~ Tissue, data=tmp4,group.by="Age" )
+#plot of TF activity by gene age, testis and ovary
+tmp4<-tmp4 %>% group_by(Age, Tissue)%>%mutate(med=median(connectivity))
+
+
+
+p1<-ggplot(tmp4,aes(x= Age, y=connectivity ))+geom_boxplot(aes( fill=Tissue), outlier.alpha=0.1)+
+       stat_pvalue_manual(data=stat.test1, label="p.adj= {format.pval(p.adj)}",y.position=c(26,30,22), x="Age")+theme_classic()+theme(axis.text=element_text(size=10))+
+ xlab("Gene age group")+ylab("Relative transcription factor activity")+geom_text(aes(y = med,x=Age, group=Tissue, label = sprintf("%0.2f",round(med,2))),position=position_dodge(width = 0.8),size = 3, vjust = -0.4, check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+
+
+#######expression vs TF activity, testis, ovary, brain
+p2<-ggplot(tmp4, aes(x=connectivity, y=logFPKM, color=Tissue)   )+geom_point(alpha=0.05)+stat_smooth(aes(fill=Tissue, linetype=Tissue), method="loess",color="black", alpha=0.8)+
+ # xlim(0,20)+
+  theme_classic()+xlab("Activity of a genes TF \n partners in tissue")+ylab("Gene expression in tissue (Log2 FPKM)")+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))+scale_color_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+p3<-ggplot(subset(connectivity, Tissue=="Male Brain" |Tissue=="Female Brain"), aes(x=connectivity, y=logFPKM, color=Tissue)   )+geom_point(alpha=0.05)+stat_smooth(aes(fill=Tissue, linetype=Tissue), method="loess", color="black", alpha=0.8)+
+ # xlim(0,20)+
+  theme_classic()+xlab("Activity of a genes TF \n partners in tissue")+ylab("Gene expression in tissue (Log2 FPKM)")+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))+scale_color_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+ks.test(subset(connectivity, Tissue=="Male Brain")$connectivity, subset(connectivity, Tissue=="Female Brain")$connectivity)
+
+#put plots together nicely
+p4<-plot_grid(p2, p3, labels = c("C", "D"),rel_widths = c(0.95,1))
+
+#lets add age vs nTF
+
+
+
+
+#interesting.  It looks like low connectivity allows expression in testis###########
+
+##Figure with Age vs nTF, age vs nPP, age vs FPKM############
+
+#read in TF data
+DroTF<-read.delim("~/Box Sync/Evan/Zhao lab notebook/Misc data/DroID_v2018_08/tf_gene.txt")
+DroTF<-data.frame(table(DroTF$FLY_TARGET_GENE))
+names(DroTF)<-c("gene", "nInteractions")
+DroTF<-join(DroTF, flydata)
+DroTF<-na.omit(DroTF)
+
+
+
+stat.test <- compare_means(nInteractions ~ Age,DroTF ) %>%
+  mutate(y.position = c(41, 55, 60))
+
+
+#must put fill in geom_boxplot for stats to work.  No idea why.
+
+DroTF<-DroTF %>% group_by(Age) %>% mutate(medtf=median(nInteractions))
+p5<-ggplot(DroTF, aes(x=Age, y=nInteractions))+geom_violin(aes(fill=Age))+geom_boxplot(fill='white',outlier.alpha=0, width=0.1)+ 
+  stat_pvalue_manual(data = stat.test, label = "p.adj= {format.pval(p.adj)}",  xmin = "group1", xmax = "group2", y.position = c(55,60,65), tip.length = 0) +
+  theme_classic()+theme(legend.position='none',axis.text=element_text(size=10))+xlab("Gene age")+ylab("Number of TFs")+geom_text(aes(y = medtf,x=Age, label = medtf),position=position_dodge(width = 0.8),size = 3, vjust = -0.6, check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))+ylim(0,65)
+
+p6<-plot_grid(p1, p5, labels=c("A", "B"), nrow=1)
+p7<-plot_grid(p6, p4, nrow=2, rel_widths = c(1.3,1))
+#p7
+#ggsave(plot = p7, "~/Box Sync/Evan/Zhao lab notebook/Writing/Tissue specificity paper/200820_Figure3.pdf", width=10, height=8)
+```
+
+
+
+
+```{r Figure 4, fig.width=8, fig.height=10}
+testisPeaks$V1<-paste("chr", testisPeaks$V1, sep = "")
+ovaryPeaks$V1<-paste("chr", ovaryPeaks$V1, sep = "")
+S2Peaks$V1<-paste("chr", S2Peaks$V1, sep = "")
+
+names(testisPeaks)<-c("Chr","Start", "End", "Name", "score", "strand", "signalValue", "pvalue", "qvalue", "peak")
+names(ovaryPeaks)<-c("Chr","Start", "End", "Name", "score", "strand", "signalValue", "pvalue", "qvalue", "peak")
+names(S2Peaks)<-c("Chr","Start", "End", "Name", "score", "strand", "signalValue", "pvalue", "qvalue", "peak")
+
+annoData <- toGRanges(TxDb.Dmelanogaster.UCSC.dm6.ensGene)
+
+testisPeaks <- toGRanges(testisPeaks, format="narrowPeak")
+testisPeaks<-subset(testisPeaks, seqnames %in% c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+testisPeaks<-keepSeqlevels(testisPeaks, value = c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+
+ovaryPeaks <- toGRanges(ovaryPeaks, format="narrowPeak")
+ovaryPeaks<-subset(ovaryPeaks, seqnames %in% c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+ovaryPeaks<-keepSeqlevels(ovaryPeaks, value = c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+
+S2Peaks <- toGRanges(S2Peaks, format="narrowPeak")
+S2Peaks<-subset(S2Peaks, seqnames %in% c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+S2Peaks<-keepSeqlevels(S2Peaks, value = c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+
+annoData2<-subset(annoData, seqnames %in% c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+annoData2<-keepSeqlevels(annoData2, value = c("chr2L", "chr2R", "chr3L", "chr3R", "chrX",  "chrY", "chr4"))
+
+
+# p values >.05 (it's negative log transformed in the data: -log10(.05)=1.3)
+testisPeaks<-subset(testisPeaks, qvalue>1.3)
+ovaryPeaks<-subset(ovaryPeaks, qvalue>1.3)
+S2Peaks<-subset(S2Peaks, qvalue>1.3)
+
+
+testisAnno <- annotatePeakInBatch(testisPeaks, AnnotationData=annoData2, output ="overlapping",
+                                   FeatureLocForDistance="TSS",select = "first",
+                                   bindingRegion=c(-2000, 100))
+ovaryAnno <- annotatePeakInBatch(ovaryPeaks, AnnotationData=annoData2, output ="overlapping",
+                                   FeatureLocForDistance="TSS",select = "first",
+                                   bindingRegion=c(-2000, 100))
+S2Anno <- annotatePeakInBatch(S2Peaks, AnnotationData=annoData2, output ="overlapping",
+                                   FeatureLocForDistance="TSS",select = "first",
+                                   bindingRegion=c(-2000, 100))
+
+
+
+testisAnno<-data.frame(gene=unique(testisAnno$feature))
+testisAnno$Tissue<-"Testis"
+testisAnno$isPeak<-"Yes"
+testisAnno<-join(testisAnno,flydata,by=c("gene", "Tissue"), type="left")
+testisAnno<-na.omit(testisAnno)
+
+ispeak<-join(data.frame(subset(flydata,Tissue=="Testis")), data.frame(gene=testisAnno$gene, isPeak=testisAnno$isPeak))
+ispeak$isPeak<-ifelse(is.na(ispeak$isPeak), "No", "Yes" )
+
+tissuepeaks<-ispeak
+
+ovaryAnno<-data.frame(gene=unique(ovaryAnno$feature))
+ovaryAnno$Tissue<-"Ovary"
+ovaryAnno$isPeak<-"Yes"
+ovaryAnno<-join(ovaryAnno,flydata,by=c("gene", "Tissue"))
+ovaryAnno<-na.omit(ovaryAnno)
+ispeak<-join(data.frame(subset(flydata,Tissue=="Ovary")), data.frame(gene=ovaryAnno$gene, isPeak=ovaryAnno$isPeak))
+ispeak$isPeak<-ifelse(is.na(ispeak$isPeak), "No", "Yes" )
+
+tissuepeaks<-rbind(tissuepeaks, ispeak)
+
+
+
+
+S2Anno<-data.frame(gene=unique(S2Anno$feature))
+S2Anno$Tissue<-"Male Carcass"
+S2Anno$isPeak<-"Yes"
+S2Anno<-join(S2Anno,flydata,by=c("gene", "Tissue"))
+S2Anno<-na.omit(S2Anno)
+
+ispeak<-join(data.frame(subset(flydata,Tissue=="Male Carcass")), data.frame(gene=S2Anno$gene, isPeak=S2Anno$isPeak))
+ispeak$isPeak<-ifelse(is.na(ispeak$isPeak), "No", "Yes" )
+
+tissuepeaks<-rbind(tissuepeaks, ispeak)
+tissuepeaks<-unique(tissuepeaks)
+
+
+
+nAge<-data.frame(age=table(unique(flydata[,c("Age", "gene")])$Age))
+colnames(nAge)<-c("Age", "totalAge")
+
+nTestis<-data.frame(table(subset(tissuepeaks, Tissue=="Testis" & isPeak=="Yes")$Age))
+colnames(nTestis)<-c("Age", "totalTissue")
+nTestis<-join(nTestis, nAge)
+nTestis$prop<-nTestis$totalTissue/nTestis$totalAge
+nTestis$Tissue<-"Testis"
+
+nOvary<-data.frame(table(subset(tissuepeaks, Tissue=="Ovary" & isPeak=="Yes")$Age))
+colnames(nOvary)<-c("Age", "totalTissue")
+nOvary<-join(nOvary, nAge)
+nOvary$prop<-nOvary$totalTissue/nOvary$totalAge
+nOvary$Tissue<-"Ovary"
+
+nS2<-data.frame(table(subset(tissuepeaks, Tissue=="Male Carcass" & isPeak=="Yes")$Age))
+colnames(nS2)<-c("Age", "totalTissue")
+nS2<-join(nS2, nAge)
+nS2$prop<-nS2$totalTissue/nS2$totalAge
+nS2$Tissue<-"S2"
+
+#get proportion of genes with peaks in each tissue
+propTissue<-rbind(nTestis, nOvary, nS2)
+
+#get confidence intervals for proportions
+tmp<-data.frame()
+for (i in c(1:9)){
+  tmp2<-prop.test(propTissue$totalTissue[i], propTissue$totalAge[i])$conf.int
+tmp<-rbind(tmp, tmp2)
+}
+
+colnames(tmp)<-c("min", "max")
+propTissue$min<-tmp$min
+propTissue$max<-tmp$max
+
+p1<-ggplot(propTissue, aes(x=Age, y=prop, group=Tissue, col=Tissue, fill=Tissue))+theme_classic()+theme(axis.text=element_text(size=10), legend.text=element_text(size=10))+
+  geom_point(aes(fill=Tissue))+geom_line()+ylab("Proportions of genes with ATAC peaks \n in promoters")+
+  geom_errorbar(aes(ymin=min, ymax=max), width=0.1)+ylim(0,1)+scale_color_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+
+#now make a figure showing that having a peak correlates with expression: Testis, ovary, wholebody
+
+tissuepeaks<-tissuepeaks %>% group_by(Tissue, isPeak) %>%mutate(med=median(FPKM))
+
+p2<-ggplot(subset(tissuepeaks, Tissue=="Testis"), aes(x= isPeak, y=FPKM,fill=isPeak))+geom_violin()+geom_boxplot(width=0.2, fill="white", outlier.shape = NA)+stat_compare_means(label= "p.signif", label.x.npc=0.2)+ylab("Testis FPKM")+theme_classic()+labs(fill="Testis ATAC peak")+theme(axis.text=element_text(size=10),legend.position='none', axis.title=element_text(size=10))+xlab("Does gene have ATAC-seq \n peak in testis?")+ylim(0,50)+geom_text(aes(y = med,x=isPeak, label = sprintf("%0.2f",round(med,2))),position=position_dodge(width = 0.8),size = 2.5,vjust=-0.8, check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+p3<-ggplot(subset(tissuepeaks, Tissue=="Ovary"), aes(x= isPeak, y=FPKM, fill=isPeak))+geom_violin()+geom_boxplot(width=0.2, fill="white", outlier.shape=NA)+stat_compare_means(label= "p.signif", label.x.npc=0.2)+ylab("Ovary FPKM")+theme_classic()+labs(fill="Ovary ATAC peak")+theme(axis.text=element_text(size=10),legend.position='none', axis.title=element_text(size=10))+xlab("Does gene have ATAC-seq \n peak in ovary?")+ylim(0,50)+geom_text(aes(y = med,x=isPeak, label = sprintf("%0.2f",round(med,2))),position=position_dodge(width = 0.8),size = 2.5,vjust=1.5, check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+
+p4<-ggplot(subset(tissuepeaks, Tissue=="Male Carcass"), aes(x= isPeak, y=FPKM, fill=isPeak))+geom_violin()+geom_boxplot(width=0.2, fill="white", outlier.shape=NA)+stat_compare_means(label= "p.signif", label.x.npc=0.2)+ylab("Male Carcass FPKM")+theme_classic()+labs(fill="S2 ATAC peak")+theme(axis.text=element_text(size=10), legend.position='none',axis.title=element_text(size=10))+xlab("Does gene have ATAC-seq \n peak in S2 cells?")+ylim(0,50)+geom_text(aes(y = med,x=isPeak, label = sprintf("%0.2f",round(med,2))),position=position_dodge(width = 0.8),size = 2.5,vjust=-1, check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+
+p5<-plot_grid(p2, p3, p4, nrow=1, labels=c("B", "C", "D"))
+p6<-plot_grid(p1, p5, nrow=2, labels=c("A", ""))
+
+
+
+tmp4<-tmp4 %>%group_by(Tissue, isPeak) %>%mutate(med=median(connectivity))
+p7<-ggplot(subset(tmp4, Tissue=="Testis"), aes(x=isPeak, y=connectivity, fill=isPeak ))+geom_violin()+geom_boxplot(width=0.15, fill="white", outlier.shape=NA)+theme_classic()+stat_compare_means(method = "wilcox", label = "p.signif", label.x.npc = 0.5)+ylab("TF activity in testis") + xlab("Does gene have promoter ATAC-seq \npeak in testis?")+theme(legend.position='none')+geom_text(aes(y = med,x=isPeak, label = sprintf("%0.2f",round(med,2))),position=position_dodge(width = 0.8),size = 2.5,vjust=-1.5, check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+p8<-ggplot(subset(tmp4,  Tissue=="Ovary"), aes(x=isPeak, y=connectivity, fill=isPeak ))+geom_violin()+geom_boxplot(width=0.15, fill="white", outlier.shape=NA)+
+  theme_classic()+stat_compare_means(method="wilcox", label = "p.signif", label.x.npc = 0.5)+ylab("TF activity in ovary") + xlab("Does gene have promoter ATAC-seq \npeak in ovary?")+theme(legend.position='none')+geom_text(aes(y = med,x=isPeak, label = sprintf("%0.2f",round(med,2))),position=position_dodge(width = 0.8),size = 2.5,vjust=-1.5, check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+p9<-plot_grid(p7, p8, labels=c("E","F"))
+########figure 4
+plot_grid(p6,p9, nrow=2, rel_heights=c(2.2,1))
+#ggsave("~/Box Sync/Evan/Zhao lab notebook/Writing/Tissue specificity paper/200910_figure4.pdf",width=9.5, height=11)
+
+
+############proportion of shared peaks
+
+testisovaryshared<-unique(join(testisAnno[,c("gene", "Age")], ovaryAnno[,c("gene", "Age")], type="inner"))
+nTestisOvaryShared<-data.frame(table(testisovaryshared$Age))
+colnames(nTestisOvaryShared)<-c("Age", "totalTissue")
+nTestisOvaryShared<-join(nTestisOvaryShared, nAge)
+nTestisOvaryShared$prop<-nTestisOvaryShared$totalTissue/nTestisOvaryShared$totalAge
+nTestisOvaryShared$Tissue<-"Testis Ovary shared"
+
+
+#expression vs ispeak, low TF activity, high TF activity
+tmp4<-unique(join(connectivity, tissuepeaks))
+tmp4<-subset(tmp4, Tissue=="Ovary" |Tissue=="Testis")
+
+#median connectivity for each tissue
+tmp4 %>%  group_by(Tissue)%>%summarise(med=median(connectivity))
+#ovary: 8.97, testis, 6.49
+tmp5<-subset(tmp4, Tissue=="Ovary")
+tmp5$connectivitybin<-ifelse(tmp5$connectivity<median(tmp5$connectivity), "Low", "High")
+tmp6<-subset(tmp4, Tissue=="Testis")
+tmp6$connectivitybin<-ifelse(tmp6$connectivity<median(tmp6$connectivity), "Low", "High")
+
+tmp4<-rbind(tmp5, tmp6)
+tmp4$connectivitybin<-factor(tmp4$connectivitybin, levels=c("Low", "High"))
+
+
+
+tmp4 %>% group_by(Tissue, connectivitybin) %>% wilcox_test(logFPKM ~isPeak) %>% adjust_pvalue() 
+
+stat1<-tmp4 %>% group_by(Tissue, connectivitybin) %>% summarise(meds=median(FPKM))
+stat2<-tmp4 %>% group_by(Tissue, isPeak) %>% summarise(meds=median(FPKM))
+
+
+#Figure 5
+
+#get medians for table 1, figure 5
+tmp4<-tmp4 %>% group_by(Tissue, connectivitybin, isPeak)%>%mutate(med=median(FPKM))
+
+ggplot(tmp4, aes(x=isPeak, y=FPKM,fill=connectivitybin))+geom_boxplot(outlier.shape=NA)+stat_compare_means(aes(group=connectivitybin),label="p.signif")+facet_wrap(~Tissue)+theme_classic()+labs(fill="TF activity", y="FPKM", x="Does gene have detectable open chromatin in its promoter?")+ylim(0,80)+geom_text(aes(y = med,x=isPeak, group=connectivitybin, label = round(med,2)),position=position_dodge(width = 0.8),size = 3, vjust = -0.6,check_overlap = T)+scale_fill_manual(values=c("#b87e39",
+"#6287da",
+"#67ad61",
+"#8653aa",
+"#b94971"))
+
+```
+
+
+```{r Supplement, fig.width=8, fig.height=10}
+supp_figure1
+
+p1<-ggplot(subset(tmp4, Tissue=="Testis"), aes(x=isPeak, y=logFPKM, fill=connectivitybin) )+geom_boxplot(outlier.shape=NA)+stat_compare_means(aes(x=isPeak, y=logFPKM, fill=connectivitybin), method="wilcox")+theme_classic()+labs(fill="TF activity", x="Does gene have\n ATAC peak in testis?")
+p2<-ggplot(subset(tmp4, Tissue=="Ovary"), aes(x=isPeak, y=logFPKM, fill=connectivitybin) )+geom_boxplot(outlier.shape=NA)+stat_compare_means(aes(x=isPeak, y=logFPKM, fill=connectivitybin), method="wilcox")+theme_classic()+labs(fill="TF activity",x="Does gene have\n ATAC peak in ovary?")
+supp_figure_2<-plot_grid(p1, p2, labels=c("A", "B"))
+##########
+#########
+########
+########
+#get supplemental figure with TF activity versus FPKM for every tissue.
+supp_figure_3<-ggplot(connectivity, aes(x=connectivity, y=logFPKM, color=Tissue) )+stat_cor( label.y = 10, color="black")+stat_smooth(aes(fill=Tissue), method="loess", color="black", alpha=0.8)+facet_wrap(~Tissue)+theme_classic()+xlab("Activity of a genes TF \n partners in tissue")+ylab("Gene expression in tissue (Log2 FPKM)")+theme(legend.position='none')+ylim(0,15)
+
+
+propexpressed$Tissue<-gsub(propexpressed$Tissue, pattern="Sperm", replacement=" Sperm")
+#get proportion of expressed genes, by age
+supp_figure4<-ggplot(propexpressed, aes(x=Age, y=prop, group=Tissue, col=Tissue, fill=Tissue))+theme_classic()+
+  geom_point(aes(fill=Tissue))+geom_line()+ylab("Proportions of \n genes  with FPKM>2\n in tissue")+
+  geom_errorbar(aes(ymin=min, ymax=max),width=0.4)+facet_wrap(~Tissue)+theme(axis.text=element_text(size=10),legend.position='none', axis.text.x=element_text(angle=90))+xlab("Gene age group (Young -> Old)")
+
+
